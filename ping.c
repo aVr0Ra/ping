@@ -8,7 +8,11 @@ char sendpacket[PACKET_SIZE];
 char recvpacket[PACKET_SIZE];
 struct timeval tvrecv;
 int quiet_mode = 0;
-int broadcast = 0;
+int verbose_mode = 0;  // New variable for verbose mode
+int count = MAX_NO_PACKETS;  // New variable for count
+int interval = 1;  // New variable for interval
+int packet_size = PACKET_SIZE;  // New variable for packet size
+int broadcast = 0; // Variable for broadcast mode
 
 void print_help() {
     printf("Usage: ping [options] <destination>\n");
@@ -17,6 +21,11 @@ void print_help() {
     printf("  -b           Allow pinging a broadcast address (IPv4 only)\n");
     printf("  -t <ttl>     Set the TTL value (IPv4 only)\n");
     printf("  -q           Quiet mode, only display summary at the end\n");
+    printf("  -D           Print timestamps\n");
+    printf("  -c <count>   Stop after <count> replies\n");
+    printf("  -i <interval> Seconds between sending each packet\n");
+    printf("  -s <size>    Use <size> as number of data bytes to be sent\n");
+    printf("  -v           Verbose output\n");
 }
 
 void set_ttl(int sockfd, int ttl) {
@@ -36,6 +45,29 @@ void enable_broadcast(int sockfd) {
 
 void enable_quiet_mode() {
     quiet_mode = 1;
+}
+
+void enable_verbose_mode() {
+    verbose_mode = 1;
+}
+
+void set_count(int c) {
+    count = c;
+}
+
+void set_interval(int i) {
+    interval = i;
+}
+
+void set_packet_size(int size) {
+    packet_size = size;
+    datalen = size;
+}
+
+void print_timestamp() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    printf("[%ld.%06ld] ", tv.tv_sec, tv.tv_usec);
 }
 
 unsigned short checksum(void *b, int len) {
@@ -74,51 +106,56 @@ void send_packet() {
     icmp->icmp_seq = nsend++;
     icmp->icmp_id = pid;
     gettimeofday((struct timeval *)icmp->icmp_data, NULL);
+
     packetsize = 8 + datalen;
-    icmp->icmp_cksum = checksum((unsigned short *)icmp, packetsize);
+    icmp->icmp_cksum = checksum((unsigned char *)icmp, packetsize);
 
     if (sendto(sockfd, sendpacket, packetsize, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
         perror("sendto error");
-    } else if (!quiet_mode) {
-        printf("Packet sent: %d bytes to %s\n", packetsize, inet_ntoa(dest_addr.sin_addr));
+    }
+
+    if (verbose_mode) {
+        printf("Sent ICMP packet to %s, seq=%d\n", inet_ntoa(dest_addr.sin_addr), icmp->icmp_seq);
     }
 }
 
 void recv_packet() {
-    int n, fromlen;
-    struct sockaddr_in from;
+    int n;
     struct ip *ip;
     struct icmp *icmp;
-    int iphdrlen;
-    fromlen = sizeof(from);
+    struct sockaddr_in from;
+    socklen_t fromlen = sizeof(from);
 
-    while ((n = recvfrom(sockfd, recvpacket, sizeof(recvpacket), 0, (struct sockaddr *)&from, (socklen_t *)&fromlen)) > 0) {
-        gettimeofday(&tvrecv, NULL);
-        ip = (struct ip *)recvpacket;
-        iphdrlen = ip->ip_hl << 2;
-        icmp = (struct icmp *)(recvpacket + iphdrlen);
-        if (icmp->icmp_id == pid) {
-            tv_sub(&tvrecv, (struct timeval *)icmp->icmp_data);
-            double rtt = tvrecv.tv_sec * 1000.0 + tvrecv.tv_usec / 1000.0;
-            if (!quiet_mode) {
-                printf("%d bytes from %s: icmp_seq=%u ttl=%d rtt=%.3f ms\n", n, inet_ntoa(from.sin_addr), icmp->icmp_seq, ip->ip_ttl, rtt);
-            }
-            nreceived++;
-            return;  // 只处理一次接收到的数据包
-        }
-    }
-
-    if (n < 0) {
+    if ((n = recvfrom(sockfd, recvpacket, sizeof(recvpacket), 0, (struct sockaddr *)&from, &fromlen)) < 0) {
         if (errno == EINTR) {
             return;
         }
         perror("recvfrom error");
+        return;
+    }
+
+    gettimeofday(&tvrecv, NULL);
+    ip = (struct ip *)recvpacket;
+    icmp = (struct icmp *)(recvpacket + (ip->ip_hl << 2));
+    if (icmp->icmp_type == ICMP_ECHOREPLY && icmp->icmp_id == pid) {
+        if (verbose_mode) {
+            printf("Received ICMP packet from %s, seq=%d\n", inet_ntoa(from.sin_addr), icmp->icmp_seq);
+        }
+        nreceived++;
+        if (!quiet_mode) {
+            print_timestamp();
+            tv_sub(&tvrecv, (struct timeval *)icmp->icmp_data);
+            double rtt = tvrecv.tv_sec * 1000.0 + tvrecv.tv_usec / 1000.0;
+            printf("%d bytes from %s: icmp_seq=%u ttl=%d time=%.3f ms\n",
+                   n - (ip->ip_hl << 2), inet_ntoa(from.sin_addr), icmp->icmp_seq, ip->ip_ttl, rtt);
+        }
     }
 }
 
 void statistics() {
     printf("\n--- ping statistics ---\n");
-    printf("%d packets transmitted, %d received, %.0f%% packet loss\n", nsend, nreceived, ((nsend - nreceived) * 100.0) / nsend);
+    printf("%d packets transmitted, %d received, %.0f%% packet loss\n",
+           nsend, nreceived, ((nsend - nreceived) / (double)nsend) * 100.0);
 }
 
 void timeout(int signo) {
@@ -134,20 +171,15 @@ void int_handler(int signo) {
 int main(int argc, char *argv[]) {
     struct hostent *host;
     struct protoent *protocol;
-    int ttl = 64;  // 默认TTL值
     char *destination;
-    int opt;
+    int ch, ttl = 64;
+    int print_timestamps = 0;
 
-    if (argc < 2) {
-        print_help();
-        exit(EXIT_FAILURE);
-    }
-
-    while ((opt = getopt(argc, argv, "hbt:q")) != -1) {
-        switch (opt) {
+    while ((ch = getopt(argc, argv, "hbt:qDc:i:s:v")) != -1) {
+        switch (ch) {
             case 'h':
                 print_help();
-                exit(EXIT_SUCCESS);
+                exit(0);
             case 'b':
                 broadcast = 1;
                 break;
@@ -156,6 +188,21 @@ int main(int argc, char *argv[]) {
                 break;
             case 'q':
                 enable_quiet_mode();
+                break;
+            case 'D':
+                print_timestamps = 1;
+                break;
+            case 'c':
+                set_count(atoi(optarg));
+                break;
+            case 'i':
+                set_interval(atoi(optarg));
+                break;
+            case 's':
+                set_packet_size(atoi(optarg));
+                break;
+            case 'v':
+                enable_verbose_mode();
                 break;
             default:
                 print_help();
@@ -202,12 +249,11 @@ int main(int argc, char *argv[]) {
     signal(SIGALRM, timeout);
     signal(SIGINT, int_handler);
 
-    // 设置循环发送和接收数据包
-    alarm(MAX_WAIT_TIME);  // 设置超时时间
-    while (nsend < MAX_NO_PACKETS) {
+    alarm(MAX_WAIT_TIME);  // Set timeout
+    for (int i = 0; i < count; i++) {
         send_packet();
         recv_packet();
-        sleep(1);
+        sleep(interval);
     }
 
     statistics();

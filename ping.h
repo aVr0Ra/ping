@@ -29,5 +29,12 @@ void recv_packet();
 void statistics();
 void timeout(int signo);
 void int_handler(int signo);
+void print_timestamp();
+
+extern int quiet_mode;
+extern int verbose_mode;  // New variable for verbose mode
+extern int count;         // New variable for count
+extern int interval;      // New variable for interval
+extern int packet_size;   // New variable for packet size
 
 #endif
